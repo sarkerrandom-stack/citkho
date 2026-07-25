@@ -1,8 +1,6 @@
 flask==3.0.0
 gunicorn==21.2.0
-requests==2.31.0
-beautifulsoup4==4.12.2
+playwright==1.40.0
 pytesseract==0.3.10
 pillow==10.1.0
 numpy==1.26.2
-# NO playwright, NO easyocr
