@@ -1,6 +1,6 @@
 FROM python:3.11-slim
 
-# Install Tesseract + Chromium system deps
+# Install Tesseract + Chromium system deps (no FFMPEG needed)
 RUN apt-get update && apt-get install -y \
     tesseract-ocr \
     libtesseract-dev \
@@ -19,8 +19,6 @@ RUN apt-get update && apt-get install -y \
     libxrandr2 \
     libgbm1 \
     libasound2 \
-    wget \
-    curl \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -28,7 +26,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Download Chromium browser binaries only
+# Pre-download Chromium
 RUN playwright install chromium
 
 COPY . .
@@ -36,5 +34,4 @@ COPY . .
 ENV PORT=10000
 EXPOSE 10000
 
-# Workers=1 prevents Playwright threading issues on low-RAM plans
-CMD gunicorn --bind 0.0.0.0:$PORT --timeout 180 --workers 1 --threads 2 app:app
+CMD gunicorn --bind 0.0.0.0:$PORT --timeout 180 --workers 1 --threads 1 app:app
