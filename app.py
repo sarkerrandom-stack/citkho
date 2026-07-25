@@ -14,29 +14,21 @@ import io
 app = Flask(__name__)
 
 # ─────────────────────────────────────────────
-# CAPTCHA Solver (Tesseract - lightweight)
+# CAPTCHA Solver (Tesseract)
 # ─────────────────────────────────────────────
 async def solve_captcha(image_bytes):
-    """Solve CAPTCHA using Tesseract OCR (much lighter than EasyOCR)"""
     try:
-        image = Image.open(io.BytesIO(image_bytes))
-        
-        # Preprocess for better accuracy
-        image = image.convert('L')  # Grayscale
+        image = Image.open(io.BytesIO(image_bytes)).convert('L')
         image = image.filter(ImageFilter.MedianFilter(size=3))
         enhancer = ImageEnhance.Contrast(image)
         image = enhancer.enhance(2.0)
-        
-        # Tesseract with strict alphanumeric whitelist
         text = pytesseract.image_to_string(
             image,
             config='--psm 7 --oem 3 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
         )
-        
         captcha_text = ''.join(c for c in text if c.isalnum()).upper().strip()
         print(f"  Tesseract result: '{captcha_text}' (len {len(captcha_text)})")
         return captcha_text if len(captcha_text) >= 4 else None
-        
     except Exception as e:
         print(f"  OCR Error: {e}")
         return None
@@ -46,9 +38,6 @@ async def solve_captcha(image_bytes):
 # Extract CitizenKhotian from HTML
 # ─────────────────────────────────────────────
 def extract_citizen_khotian(html_content):
-    """Extract CitizenKhotian array from Next.js rendered HTML"""
-    
-    # Method 1: Standard __NEXT_DATA__ script tag
     m = re.search(
         r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>',
         html_content, re.DOTALL
@@ -59,10 +48,8 @@ def extract_citizen_khotian(html_content):
             props = data.get('props', {}).get('pageProps', {})
             if 'CitizenKhotian' in props:
                 return props['CitizenKhotian']
-        except Exception:
-            pass
+        except: pass
 
-    # Method 2: Next.js flight data (self.__next_f.push)
     pushes = re.findall(
         r'self\.__next_f\.push\(\[1,"(.*?)"\]\)',
         html_content, re.DOTALL
@@ -70,19 +57,13 @@ def extract_citizen_khotian(html_content):
     full_text = ''.join(pushes)
     m = re.search(r'"CitizenKhotian":(\[.*?\]),"profileStatus"', full_text, re.DOTALL)
     if m:
-        try:
-            return json.loads(m.group(1))
-        except Exception:
-            pass
+        try: return json.loads(m.group(1))
+        except: pass
 
-    # Method 3: Direct search in raw HTML
     m = re.search(r'"CitizenKhotian":(\[.*?\]),"profileStatus"', html_content, re.DOTALL)
     if m:
-        try:
-            return json.loads(m.group(1))
-        except Exception:
-            pass
-
+        try: return json.loads(m.group(1))
+        except: pass
     return []
 
 
@@ -96,7 +77,6 @@ async def scrape_khotian(username, password, khotian_no):
     try:
         print(f"\n{'='*60}")
         print(f"[{datetime.now()}] Starting scrape for khotian: {khotian_no}")
-        print(f"[{datetime.now()}] Launching Chromium...")
 
         p = await async_playwright().start()
         browser = await p.chromium.launch(
@@ -121,9 +101,28 @@ async def scrape_khotian(username, password, khotian_no):
         print(f"[{datetime.now()}] Opening login page...")
         await page.goto(
             "https://lsg-land-owner.land.gov.bd/login",
-            wait_until='domcontentloaded',
+            wait_until='networkidle',
             timeout=60000
         )
+
+        # DEBUG: Save screenshot to see what's on the page
+        debug_ss = await page.screenshot()
+        with open('/tmp/login_page.png', 'wb') as f:
+            f.write(debug_ss)
+        print(f"  Screenshot saved to /tmp/login_page.png")
+
+        # Wait for form elements to be ready (up to 15 seconds)
+        print(f"[{datetime.now()}] Waiting for form elements...")
+        try:
+            await page.wait_for_selector('input[name="username"]', state='visible', timeout=15000)
+            await page.wait_for_selector('input[name="password"]', state='visible', timeout=15000)
+            await page.wait_for_selector('#mainCaptcha', state='visible', timeout=15000)
+            await page.wait_for_selector('#txtInput', state='visible', timeout=15000)
+        except Exception as e:
+            # If elements not found, dump page HTML for debugging
+            html = await page.content()
+            print(f"  Page HTML (first 2000 chars): {html[:2000]}")
+            return {"status": "failed", "message": f"Form elements not found: {str(e)}"}
 
         # Fill form
         try:
@@ -141,8 +140,6 @@ async def scrape_khotian(username, password, khotian_no):
 
         # Solve CAPTCHA
         print(f"[{datetime.now()}] Solving CAPTCHA...")
-        await page.wait_for_selector('#mainCaptcha', timeout=15000)
-
         captcha_solved = False
         for attempt in range(3):
             print(f"  CAPTCHA attempt {attempt + 1}/3")
@@ -155,7 +152,9 @@ async def scrape_khotian(username, password, khotian_no):
                 break
             else:
                 print("  Failed, reloading...")
-                await page.reload(wait_until='domcontentloaded')
+                await page.reload(wait_until='networkidle')
+                # Re-wait for elements after reload
+                await page.wait_for_selector('input[name="username"]', state='visible', timeout=15000)
                 await page.fill('input[name="username"]', username)
                 await page.fill('input[name="password"]', password)
                 await asyncio.sleep(1)
@@ -167,10 +166,17 @@ async def scrape_khotian(username, password, khotian_no):
         print(f"[{datetime.now()}] Submitting login...")
         await page.click('button[type="submit"]')
 
-        # Wait for redirect (poll for up to 20 seconds)
+        # Wait for navigation after submit
+        try:
+            await page.wait_for_load_state('networkidle', timeout=30000)
+        except Exception:
+            pass
+
+        # Poll for redirect (up to 20 seconds)
         for i in range(20):
             await asyncio.sleep(1)
             current_url = page.url
+            print(f"  Poll {i+1}: {current_url}")
             if 'login' not in current_url.lower():
                 break
         else:
@@ -178,18 +184,16 @@ async def scrape_khotian(username, password, khotian_no):
 
         print(f"  Logged in. URL: {current_url}")
 
-        # ── 2. LANDING PAGE → find LDTax link ──
+        # ── 2. LANDING PAGE ──
         print(f"[{datetime.now()}] Going to landing page...")
         await page.goto(
             "https://lsg-land-owner.land.gov.bd/landing",
-            wait_until='domcontentloaded',
+            wait_until='networkidle',
             timeout=60000
         )
 
         print(f"[{datetime.now()}] Looking for LDTax link...")
         ld_tax_link = None
-
-        # Try multiple selectors
         selectors = [
             'a:has-text("ভূমি উন্নয়ন কর")',
             'a:has-text("LDTax")',
@@ -205,7 +209,6 @@ async def scrape_khotian(username, password, khotian_no):
             except Exception:
                 continue
 
-        # Fallback: scan all links
         if not ld_tax_link:
             links = await page.query_selector_all('a')
             for link in links:
@@ -221,9 +224,9 @@ async def scrape_khotian(username, password, khotian_no):
         href = await ld_tax_link.get_attribute('href')
         print(f"  LDTax href: {href}")
 
-        # ── 3. Follow OAuth redirects ──
+        # ── 3. OAuth Redirects ──
         print(f"[{datetime.now()}] Following OAuth redirects...")
-        await page.goto(href, wait_until='domcontentloaded', timeout=60000)
+        await page.goto(href, wait_until='networkidle', timeout=60000)
 
         for i in range(20):
             current_url = page.url
@@ -238,33 +241,29 @@ async def scrape_khotian(username, password, khotian_no):
         else:
             return {"status": "failed", "message": f"Never reached welcome page. Stuck at: {page.url}"}
 
-        # ── 4. Go to khotian page ──
+        # ── 4. Khotian Page ──
         print(f"[{datetime.now()}] Opening khotian page...")
         await page.goto(
             "https://portal.ldtax.gov.bd/citizen/khotian",
-            wait_until='domcontentloaded',
+            wait_until='networkidle',
             timeout=60000
         )
-
-        # Wait for JS to render data
         await asyncio.sleep(3)
 
-        # ── 5. Extract data ──
+        # ── 5. Extract Data ──
         print(f"[{datetime.now()}] Extracting khotian data...")
         html = await page.content()
         citizen_khotians = extract_citizen_khotian(html)
         print(f"  Found {len(citizen_khotians)} records")
 
         if not citizen_khotians:
-            # Try one more time after waiting
             await asyncio.sleep(3)
             html = await page.content()
             citizen_khotians = extract_citizen_khotian(html)
             if not citizen_khotians:
                 return {"status": "failed", "message": "No khotian data found", "url": page.url}
 
-        # ── 6. Find by khotian_no ──
-        result = None
+        # ── 6. Find Match ──
         for k in citizen_khotians:
             if str(k.get('khotian_no')) == str(khotian_no):
                 result = {
@@ -280,8 +279,7 @@ async def scrape_khotian(username, password, khotian_no):
                     "mouja_jl_no": k.get('moujas', {}).get('jl_no')
                 }
                 break
-
-        if not result:
+        else:
             available = [str(k.get('khotian_no')) for k in citizen_khotians]
             return {
                 "status": "failed",
@@ -307,17 +305,9 @@ async def scrape_khotian(username, password, khotian_no):
                 pass
 
 
-# ─────────────────────────────────────────────
-# Flask Routes
-# ─────────────────────────────────────────────
 @app.route('/health', methods=['GET'])
 def health():
-    """UptimeRobot pings this to keep the service alive"""
-    return jsonify({
-        "status": "alive",
-        "service": "khotian-scraper",
-        "time": time.time()
-    })
+    return jsonify({"status": "alive", "service": "khotian-scraper", "time": time.time()})
 
 
 @app.route('/scrape', methods=['POST'])
@@ -337,7 +327,6 @@ def scrape_endpoint():
     print(f"REQUEST: khotian_no={khotian_no} | user={username}")
     print(f"{'='*60}")
 
-    # Run async scrape inside sync Flask
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
