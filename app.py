@@ -68,6 +68,28 @@ def extract_citizen_khotian(html_content):
 
 
 # ─────────────────────────────────────────────
+# Debug helper
+# ─────────────────────────────────────────────
+async def debug_page(page, label):
+    try:
+        ss = await page.screenshot()
+        with open(f'/tmp/debug_{label}.png', 'wb') as f:
+            f.write(ss)
+        html = await page.content()
+        print(f"  [DEBUG {label}] URL: {page.url}")
+        print(f"  [DEBUG {label}] HTML length: {len(html)}")
+        print(f"  [DEBUG {label}] HTML snippet (first 500 chars): {html[:500]}")
+        # Check if key elements exist
+        has_country = await page.query_selector('#country_code') is not None
+        has_user = await page.query_selector('input[name="username"]') is not None
+        has_pass = await page.query_selector('input[name="password"]') is not None
+        has_captcha = await page.query_selector('#mainCaptcha') is not None
+        print(f"  [DEBUG {label}] Elements: country={has_country}, user={has_user}, pass={has_pass}, captcha={has_captcha}")
+    except Exception as e:
+        print(f"  [DEBUG {label}] Error: {e}")
+
+
+# ─────────────────────────────────────────────
 # Main Scraping Logic
 # ─────────────────────────────────────────────
 async def scrape_khotian(username, password, khotian_no):
@@ -95,42 +117,89 @@ async def scrape_khotian(username, password, khotian_no):
         page = await context.new_page()
 
         # ── 1. LOGIN ──
-        # Use 'load' instead of 'networkidle' to avoid timeout on slow trackers
         print(f"[{datetime.now()}] Opening login page...")
+        
+        # Try networkidle first (like working code), but catch timeout
         try:
             await page.goto(
                 "https://lsg-land-owner.land.gov.bd/login",
-                wait_until='load',
-                timeout=45000
+                wait_until='networkidle',
+                timeout=60000
             )
+            print("  Page loaded with networkidle")
         except Exception as e:
-            print(f"  Load timeout, trying domcontentloaded...")
-            await page.goto(
-                "https://lsg-land-owner.land.gov.bd/login",
-                wait_until='domcontentloaded',
-                timeout=45000
-            )
+            print(f"  networkidle timeout: {e}")
+            # Fallback: domcontentloaded is usually enough
+            try:
+                await page.goto(
+                    "https://lsg-land-owner.land.gov.bd/login",
+                    wait_until='domcontentloaded',
+                    timeout=30000
+                )
+                print("  Page loaded with domcontentloaded")
+            except Exception as e2:
+                print(f"  domcontentloaded also failed: {e2}")
+                await debug_page(page, "login_load_fail")
+                return {"status": "failed", "message": f"Cannot load login page: {e2}"}
 
-        # Wait for the form to be interactive
-        print(f"[{datetime.now()}] Waiting for form elements...")
-        await page.wait_for_selector('#country_code', timeout=15000)
-        await page.wait_for_selector('input[name="username"]', timeout=15000)
-        await page.wait_for_selector('input[name="password"]', timeout=15000)
-        await page.wait_for_selector('#mainCaptcha', timeout=15000)
-        await page.wait_for_selector('#txtInput', timeout=15000)
+        # Debug: see what's on the page
+        await debug_page(page, "after_load")
 
-        # Fill form
-        await page.select_option('#country_code', '880')
-        await page.fill('input[name="username"]', username)
-        await page.fill('input[name="password"]', password)
-        await page.check('input[value="mobile"]')
+        # Fill form - try directly like working code
+        print(f"[{datetime.now()}] Filling form...")
+        try:
+            await page.select_option('#country_code', '880')
+        except Exception as e:
+            print(f"  country_code select failed: {e}")
+            # Try by name
+            try:
+                await page.select_option('select[name="country_code"]', '880')
+            except Exception as e2:
+                print(f"  select by name also failed: {e2}")
+
+        try:
+            await page.fill('input[name="username"]', username)
+        except Exception as e:
+            print(f"  username fill failed: {e}")
+            # Try alternative selectors
+            try:
+                await page.fill('#mobile', username)
+            except:
+                try:
+                    await page.fill('input#mobile', username)
+                except Exception as e2:
+                    print(f"  all username selectors failed: {e2}")
+                    await debug_page(page, "username_fail")
+                    return {"status": "failed", "message": f"Cannot find username field: {e2}"}
+
+        try:
+            await page.fill('input[name="password"]', password)
+        except Exception as e:
+            print(f"  password fill failed: {e}")
+            try:
+                await page.fill('#see-password', password)
+            except Exception as e2:
+                print(f"  all password selectors failed: {e2}")
+                return {"status": "failed", "message": f"Cannot find password field: {e2}"}
+
+        try:
+            await page.check('input[value="mobile"]')
+        except Exception as e:
+            print(f"  mobile radio check failed (non-critical): {e}")
 
         # Solve CAPTCHA
         print(f"[{datetime.now()}] Solving CAPTCHA...")
         captcha_code = None
         for attempt in range(3):
             print(f"  CAPTCHA attempt {attempt + 1}/3")
-            captcha_bytes = await page.locator('#mainCaptcha').screenshot()
+            
+            try:
+                captcha_bytes = await page.locator('#mainCaptcha').screenshot()
+            except Exception as e:
+                print(f"  Cannot screenshot captcha: {e}")
+                await debug_page(page, f"captcha_screenshot_fail_{attempt}")
+                break
+
             captcha_code = await solve_captcha(captcha_bytes)
 
             if captcha_code and len(captcha_code) >= 4:
@@ -138,25 +207,45 @@ async def scrape_khotian(username, password, khotian_no):
                 break
             else:
                 print(f"  ❌ Failed, refreshing...")
-                await page.reload(wait_until='load')
-                # Re-wait for elements after reload
-                await page.wait_for_selector('input[name="username"]', timeout=15000)
-                await page.select_option('#country_code', '880')
-                await page.fill('input[name="username"]', username)
-                await page.fill('input[name="password"]', password)
-                await page.check('input[value="mobile"]')
+                try:
+                    await page.reload(wait_until='networkidle')
+                except:
+                    try:
+                        await page.reload(wait_until='domcontentloaded')
+                    except Exception as e:
+                        print(f"  Reload failed: {e}")
+                        break
+                # Re-fill after reload
+                try:
+                    await page.select_option('#country_code', '880')
+                    await page.fill('input[name="username"]', username)
+                    await page.fill('input[name="password"]', password)
+                    await page.check('input[value="mobile"]')
+                except Exception as e:
+                    print(f"  Re-fill after reload failed: {e}")
                 await asyncio.sleep(1)
 
         if not captcha_code:
             return {"status": "failed", "message": "CAPTCHA failed after 3 attempts"}
 
-        await page.fill('#txtInput', captcha_code)
+        try:
+            await page.fill('#txtInput', captcha_code)
+        except Exception as e:
+            print(f"  txtInput fill failed: {e}")
+            return {"status": "failed", "message": f"Cannot fill captcha input: {e}"}
 
         # Submit
         print(f"[{datetime.now()}] Submitting form...")
-        await page.click('button[type="submit"]')
+        try:
+            await page.click('button[type="submit"]')
+        except Exception as e:
+            print(f"  Submit click failed: {e}")
+            try:
+                await page.click('.reg_btn')
+            except Exception as e2:
+                return {"status": "failed", "message": f"Cannot click submit: {e2}"}
 
-        # Wait for navigation after submit
+        # Wait for navigation
         try:
             await page.wait_for_load_state('networkidle', timeout=30000)
         except:
@@ -169,6 +258,7 @@ async def scrape_khotian(username, password, khotian_no):
             if 'login' not in current_url.lower():
                 break
         else:
+            await debug_page(page, "login_stuck")
             return {"status": "failed", "message": "Login failed — still on login page"}
 
         print(f"  Logged in. URL: {current_url}")
@@ -178,20 +268,29 @@ async def scrape_khotian(username, password, khotian_no):
             if 'captcha' in content.lower() and 'invalid' in content.lower():
                 return {"status": "failed", "message": "Login failed: Invalid captcha or credentials"}
 
-        # Handle OAuth callback
         if 'callback?code=' in current_url:
-            await page.reload(wait_until='load')
+            try:
+                await page.reload(wait_until='networkidle')
+            except:
+                await page.reload(wait_until='domcontentloaded')
 
         final_url = page.url
         print(f"  ✅ Login successful! Final URL: {final_url}")
 
         # ── 2. LANDING PAGE ──
         print(f"[{datetime.now()}] Going to landing page...")
-        await page.goto(
-            "https://lsg-land-owner.land.gov.bd/landing",
-            wait_until='load',
-            timeout=45000
-        )
+        try:
+            await page.goto(
+                "https://lsg-land-owner.land.gov.bd/landing",
+                wait_until='networkidle',
+                timeout=60000
+            )
+        except:
+            await page.goto(
+                "https://lsg-land-owner.land.gov.bd/landing",
+                wait_until='domcontentloaded',
+                timeout=30000
+            )
 
         print(f"[{datetime.now()}] Looking for LDTax link...")
         ld_tax_link = None
@@ -226,7 +325,10 @@ async def scrape_khotian(username, password, khotian_no):
 
         # ── 3. OAuth Redirects ──
         print(f"[{datetime.now()}] Following OAuth redirects...")
-        await page.goto(href, wait_until='load', timeout=45000)
+        try:
+            await page.goto(href, wait_until='networkidle', timeout=60000)
+        except:
+            await page.goto(href, wait_until='domcontentloaded', timeout=30000)
 
         for i in range(15):
             current_url = page.url
@@ -243,11 +345,18 @@ async def scrape_khotian(username, password, khotian_no):
 
         # ── 4. Khotian Page ──
         print(f"[{datetime.now()}] Opening khotian page...")
-        await page.goto(
-            "https://portal.ldtax.gov.bd/citizen/khotian",
-            wait_until='load',
-            timeout=45000
-        )
+        try:
+            await page.goto(
+                "https://portal.ldtax.gov.bd/citizen/khotian",
+                wait_until='networkidle',
+                timeout=60000
+            )
+        except:
+            await page.goto(
+                "https://portal.ldtax.gov.bd/citizen/khotian",
+                wait_until='domcontentloaded',
+                timeout=30000
+            )
         await asyncio.sleep(3)
 
         # ── 5. Extract Data ──
